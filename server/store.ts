@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, createHash } from 'node:crypto'
-import { widgetIds, type AppEvent, type Conversation, type ConversationDetail, type Fact, type Settings, type Turn, type WidgetId, type WidgetState } from '../shared/types.js'
+import { widgetIds, type AppEvent, type Conversation, type ConversationDetail, type Fact, type PatientProfile, type Settings, type Turn, type WidgetId, type WidgetState } from '../shared/types.js'
 import type { Database } from './db.js'
 
 export class Store {
@@ -21,6 +21,16 @@ export class Store {
   async list(visitorId: string): Promise<Conversation[]> {
     const r = await this.db.query<Conversation>('SELECT * FROM conversations WHERE visitor_id=$1 ORDER BY started_at DESC LIMIT 50', [visitorId])
     return r.rows
+  }
+
+  async profile(visitorId: string): Promise<PatientProfile> {
+    const facts = await this.db.query<Fact>(
+      `SELECT f.* FROM facts f JOIN conversations c ON c.id=f.conversation_id
+       WHERE c.visitor_id=$1 AND f.status <> 'corrected' ORDER BY f.created_at DESC, f.id DESC`, [visitorId])
+    const conversations = await this.db.query<{ count: string; last_activity: string | null }>(
+      `SELECT count(*)::text AS count, max(COALESCE(ended_at, started_at)) AS last_activity
+       FROM conversations WHERE visitor_id=$1`, [visitorId])
+    return { facts: facts.rows, conversation_count: Number(conversations.rows[0]?.count || 0), last_activity: conversations.rows[0]?.last_activity || null }
   }
 
   async voiceCallsToday(visitorId: string): Promise<number> {

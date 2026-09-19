@@ -107,10 +107,14 @@ export function startAnalysis(store: Store): { kick: () => void; stop: () => voi
         return
       }
       const existing = await store.facts(job.conversation_id, job.widget)
+      // Include the patient's longitudinal memory so a new call can refine or
+      // avoid duplicating details captured in earlier conversations.
+      const longitudinal = (await store.profile(conversation?.visitor_id || '')).facts
+      const knownFacts = [...longitudinal.filter(f => f.conversation_id !== job.conversation_id), ...existing]
       const manuallyCorrected = existing.some(f => f.source_turn_id === turn.id && f.supersedes_id)
       const extracted = modelKey
-        ? provider === 'gemini' ? await geminiExtract(job.widget, turn, turns, existing)
-          : await modelExtract(job.widget, turn, turns, existing)
+        ? provider === 'gemini' ? await geminiExtract(job.widget, turn, turns, knownFacts)
+          : await modelExtract(job.widget, turn, turns, knownFacts)
         : ruleExtract(job.widget, turn)
       for (const item of extracted) {
         if (manuallyCorrected) continue

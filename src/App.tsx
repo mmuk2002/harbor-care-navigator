@@ -4,10 +4,10 @@ import {
   ChevronRight, Clock3, HeartHandshake, History, Info, LayoutGrid, Mic, MicOff,
   Play, Send, Settings2, ShieldCheck, Sparkles, Square, Users, Volume2, X,
 } from 'lucide-react'
-import type { Conversation, ConversationDetail, Fact, Settings, Turn, WidgetId } from '../shared/types'
+import type { Conversation, ConversationDetail, Fact, PatientProfile, Settings, Turn, WidgetId } from '../shared/types'
 import { GeminiAudio } from './geminiAudio'
 
-const defaultSettings: Settings = { provider: 'openai', mode: 'family', style: 'gentle', pace: 'unhurried', focus: 'everyday', voice: 'marin' }
+const defaultSettings: Settings = { provider: 'openai', mode: 'patient', style: 'gentle', pace: 'unhurried', focus: 'everyday', voice: 'marin' }
 const widgetMeta: Record<WidgetId, { title: string; subtitle: string; icon: typeof Users; color: string }> = {
   circle: { title: 'Care circle', subtitle: 'People who matter', icon: Users, color: 'blue' },
   timeline: { title: 'Care timeline', subtitle: 'Events and plans', icon: CalendarDays, color: 'amber' },
@@ -44,6 +44,7 @@ export default function App() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [detail, setDetail] = useState<ConversationDetail | null>(null)
   const [providers, setProviders] = useState({ openai: false, gemini: false })
+  const [profile, setProfile] = useState<PatientProfile>({ facts: [], conversation_count: 0, last_activity: null })
   const voiceConfigured = providers[settings.provider]
   const [page, setPage] = useState<'home' | 'call' | 'workspace' | 'history'>('home')
   const [callState, setCallState] = useState<'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'ended'>('idle')
@@ -72,6 +73,10 @@ export default function App() {
     if (activeId.current === id) setDetail(next)
   }, [])
 
+  const refreshProfile = useCallback(async () => {
+    setProfile(await api<PatientProfile>('/api/profile'))
+  }, [])
+
   const openConversation = useCallback(async (id: string, target: typeof page = 'call') => {
     activeId.current = id
     setError('')
@@ -87,7 +92,7 @@ export default function App() {
       ws.onopen = () => setStatus(current => current === 'Live updates disconnected. Reconnectingâ€¦' ? 'Live updates restored.' : current)
       ws.onmessage = () => {
         if (refreshTimer.current) clearTimeout(refreshTimer.current)
-        refreshTimer.current = setTimeout(() => { void refresh(id).catch(setErrorFromUnknown) }, 80)
+        refreshTimer.current = setTimeout(() => { void Promise.all([refresh(id), refreshProfile()]).catch(setErrorFromUnknown) }, 80)
       }
       ws.onclose = () => {
         if (activeId.current !== id || socket.current !== ws) return
@@ -101,8 +106,8 @@ export default function App() {
   function setErrorFromUnknown(value: unknown) { setError(value instanceof Error ? value.message : String(value)) }
 
   useEffect(() => {
-    void api<{ conversations: Conversation[]; providers: { openai: boolean; gemini: boolean } }>('/api/bootstrap')
-      .then(data => { setConversations(data.conversations); setProviders(data.providers)
+    void api<{ conversations: Conversation[]; providers: { openai: boolean; gemini: boolean }; profile: PatientProfile }>('/api/bootstrap')
+      .then(data => { setConversations(data.conversations); setProviders(data.providers); setProfile(data.profile)
         if (!data.providers.openai && data.providers.gemini) setSettings(value => ({ ...value, provider: 'gemini', voice: 'Kore' })) })
       .catch(setErrorFromUnknown)
     const timer = setInterval(() => setTick(value => value + 1), 1000)
@@ -197,8 +202,8 @@ export default function App() {
     setError('')
     try {
       const { id } = await api<{ id: string }>('/api/sample', { method: 'POST' })
-      const bootstrap = await api<{ conversations: Conversation[] }>('/api/bootstrap')
-      setConversations(bootstrap.conversations)
+      const bootstrap = await api<{ conversations: Conversation[]; profile: PatientProfile }>('/api/bootstrap')
+      setConversations(bootstrap.conversations); setProfile(bootstrap.profile)
       await openConversation(id, 'workspace')
     } catch (cause) { setErrorFromUnknown(cause) }
   }
@@ -234,7 +239,8 @@ export default function App() {
       await api(`/api/conversations/${activeId.current}/end`, { method: 'POST' })
       cleanupMedia()
       await refresh(activeId.current)
-      setConversations(await api<{ conversations: Conversation[] }>('/api/bootstrap').then(value => value.conversations))
+      const bootstrap = await api<{ conversations: Conversation[]; profile: PatientProfile }>('/api/bootstrap')
+      setConversations(bootstrap.conversations); setProfile(bootstrap.profile)
       setStatus('Conversation saved')
     } catch (cause) { cleanupMedia(); setErrorFromUnknown(cause); setStatus('Could not confirm final save') }
     finally { ending.current = false }
@@ -247,6 +253,7 @@ export default function App() {
     try {
       await api(`/api/conversations/${detail.conversation.id}/turns`, { method: 'POST', body: JSON.stringify({ text }) })
       await refresh(detail.conversation.id)
+      await refreshProfile()
     } catch (cause) { setErrorFromUnknown(cause) }
   }
 
@@ -283,7 +290,8 @@ export default function App() {
     const meta = widgetMeta[widget]
     const Icon = meta.icon
     const state = detail?.widgets.find(value => value.widget === widget)
-    const allFacts = detail?.facts.filter(value => value.widget === widget) || []
+    const allFacts = Array.from(new Map((profile.facts.filter(value => value.widget === widget).concat(detail?.facts.filter(value => value.widget === widget) || []))
+      .map(fact => [fact.id, fact])).values())
     const visibleFacts = replayIndex === null ? allFacts : (detail?.events.slice(0, replayIndex + 1)
       .filter(event => event.type === 'fact').map(event => event.data as Fact).filter(value => value.widget === widget) || [])
     const facts = visibleFacts.filter(value => value.status !== 'corrected')
@@ -302,7 +310,7 @@ export default function App() {
             <textarea aria-label={`Correct ${fact.title}`} value={editValue} onChange={event => setEditValue(event.target.value)} />
             <div><button className="text-button" onClick={() => setEditingFact(null)}>Cancel</button><button className="small-primary" onClick={() => void saveCorrection(fact)}>Save correction</button></div>
           </div> : <><p>{fact.detail}</p><div className="fact-actions">
-            <button onClick={() => openSource(fact.source_turn_id)}>View source <ChevronRight size={13} /></button>
+            <button onClick={() => detail?.turns.some(turn => turn.id === fact.source_turn_id) ? openSource(fact.source_turn_id) : undefined}>{detail?.turns.some(turn => turn.id === fact.source_turn_id) ? 'View source' : 'From earlier conversation'} <ChevronRight size={13} /></button>
             {replayIndex === null && <button onClick={() => { setEditingFact(fact.id); setEditValue(fact.detail) }}>Correct</button>}
           </div></>}
         </article>) : <div className="empty-widget"><span className="empty-dash">âœ¦</span><p>{widget === 'circle' ? 'People and helpers will appear here.' : widget === 'timeline' ? 'Important events will take shape here.' : widget === 'needs' ? 'Weâ€™ll keep track of what matters.' : 'Agreed actions will stay visible here.'}</p></div>}
@@ -325,19 +333,20 @@ export default function App() {
     {error && <div className="error-banner" role="alert"><Info size={17} /><span>{error}</span><button onClick={() => setError('')} aria-label="Dismiss error"><X size={17} /></button></div>}
 
     {page === 'home' && <main className="home-main">
-      <div className="hero-copy"><div className="eyebrow"><Sparkles size={14} /> A calmer way forward</div><h1>Every conversation<br /><em>moves care forward.</em></h1><p>Harbor is an AI, non-clinical care navigator. Talk through whatâ€™s happening, remember what matters, and find one clear next step.</p><div className="hero-actions"><button className="primary-button" onClick={() => void start()} disabled={callState === 'connecting'}><Mic size={18} />{voiceConfigured ? 'Start a conversation' : 'Open text sandbox'}<ArrowRight size={18} /></button><span className="privacy-caption"><ShieldCheck size={16} /> Your conversation is saved privately</span></div><button className="sample-link" onClick={() => void openSample()}><Play size={15} /> Explore a fictional sample conversation</button></div>
+      <div className="hero-copy"><div className="eyebrow"><Sparkles size={14} /> A calmer way forward</div><h1>Every conversation<br /><em>moves care forward.</em></h1><p>Harbor is an AI, non-clinical care navigator for you. Talk through whatâ€™s happening, remember what matters, and find one clear next step.</p><div className="hero-actions"><button className="primary-button" onClick={() => void start()} disabled={callState === 'connecting'}><Mic size={18} />{voiceConfigured ? 'Start a conversation' : 'Open text sandbox'}<ArrowRight size={18} /></button><span className="privacy-caption"><ShieldCheck size={16} /> Your conversation is saved privately</span></div><button className="sample-link" onClick={() => void openSample()}><Play size={15} /> Explore a fictional sample conversation</button></div>
       <div className="hero-art" aria-hidden="true"><div className="hero-ring outer" /><div className="hero-ring mid" /><div className="hero-ring inner" /><div className="hero-orb"><AudioLines size={57} strokeWidth={1.4} /></div><span className="orbit-label orbit-one">A little clarity</span><span className="orbit-label orbit-two">One step at a time</span></div>
       <div className="home-bottom">
         <section className="settings-panel">
           <div className="section-kicker"><Settings2 size={15} /> MAKE IT YOURS</div>
           <h2>How would you like to talk?</h2>
           <p>Choose what feels comfortable. You can change this before each conversation.</p>
-          <div className="setting-row"><label>Iâ€™m here as</label><div className="segmented"><button className={settings.mode === 'family' ? 'selected' : ''} onClick={() => setSettings({ ...settings, mode: 'family' })}>Family or caregiver</button><button className={settings.mode === 'patient' ? 'selected' : ''} onClick={() => setSettings({ ...settings, mode: 'patient' })}>Patient</button></div></div>
+          <div className="setting-row"><label>Iâ€™m here as</label><div className="patient-identity"><Users size={15} /> Patient</div></div>
           <div className="setting-row"><label>Voice service</label><div className="segmented"><button className={settings.provider === 'openai' ? 'selected' : ''} onClick={() => setSettings({ ...settings, provider: 'openai', voice: 'marin' })}>OpenAI {providers.openai ? '' : 'Â· setup needed'}</button><button className={settings.provider === 'gemini' ? 'selected' : ''} onClick={() => setSettings({ ...settings, provider: 'gemini', voice: 'Kore' })}>Gemini {providers.gemini ? '' : 'Â· setup needed'}</button></div></div>
           <div className="settings-grid"><label>Conversation style<select value={settings.style} onChange={event => setSettings({ ...settings, style: event.target.value as Settings['style'] })}><option value="gentle">Gentle & reassuring</option><option value="direct">Clear & concise</option></select></label><label>Speaking pace<select value={settings.pace} onChange={event => setSettings({ ...settings, pace: event.target.value as Settings['pace'] })}><option value="unhurried">Unhurried</option><option value="balanced">Balanced</option></select></label><label>Todayâ€™s focus<select value={settings.focus} onChange={event => setSettings({ ...settings, focus: event.target.value as Settings['focus'] })}><option value="everyday">Everyday support</option><option value="appointments">Appointments</option><option value="caregiver">Caregiver support</option></select></label><label>Voice<select value={settings.voice} onChange={event => setSettings({ ...settings, voice: event.target.value as Settings['voice'] })}>{settings.provider === 'gemini' ? <><option value="Kore">Kore Â· steady</option><option value="Aoede">Aoede Â· light</option><option value="Sulafat">Sulafat Â· warm</option></> : <><option value="marin">Marin</option><option value="cedar">Cedar</option><option value="alloy">Alloy</option></>}</select></label></div>
           {settings.provider === 'gemini' && <p className="provider-note">Geminiâ€™s free tier may use conversation data to improve Google products. Use fictional details for this demo.</p>}
         </section>
-        <section className="recent-panel"><div className="section-kicker"><Clock3 size={15} /> CONTINUITY</div><h2>Pick up where you left off</h2><p>What you share can help the next conversation begin with context.</p>{conversations.length ? <div className="recent-list">{conversations.slice(0, 3).map(item => <button key={item.id} onClick={() => void openConversation(item.id, 'call')}><span className="recent-icon"><AudioLines size={18} /></span><span><strong>{item.settings.mode === 'patient' ? 'Patient' : 'Family'} conversation</strong><small>{readableDate(item.started_at)} Â· {item.status === 'ended' ? 'Saved' : item.status}</small></span><ChevronRight size={18} /></button>)}</div> : <div className="recent-empty"><span className="empty-sparkle">âœ¦</span><strong>Your story starts here</strong><span>Conversations and next steps will appear in this space.</span></div>}</section>
+        <section className="recent-panel"><div className="section-kicker"><Clock3 size={15} /> CONTINUITY</div><h2>Pick up where you left off</h2><p>Your care story stays with you across conversations.</p>{conversations.length ? <div className="recent-list">{conversations.slice(0, 3).map(item => <button key={item.id} onClick={() => void openConversation(item.id, 'call')}><span className="recent-icon"><AudioLines size={18} /></span><span><strong>Patient conversation</strong><small>{readableDate(item.started_at)} Â· {item.status === 'ended' ? 'Saved' : item.status}</small></span><ChevronRight size={18} /></button>)}</div> : <div className="recent-empty"><span className="empty-sparkle">âœ¦</span><strong>Your story starts here</strong><span>Conversations and next steps will appear in this space.</span></div>}</section>
+        <section className="memory-panel"><div className="section-kicker"><Sparkles size={15} /> YOUR CARE STORY</div><h2>Remembered across calls</h2><p>Confirmed details, needs, people, and next steps are carried forward.</p><div className="memory-stats"><strong>{profile.conversation_count}</strong><span>conversations</span><strong>{profile.facts.filter(f => f.widget === 'steps').length}</strong><span>saved next steps</span><strong>{profile.facts.filter(f => f.status === 'needs_review').length}</strong><span>to confirm</span></div>{profile.facts.length ? <div className="memory-chips">{profile.facts.slice(0, 6).map(fact => <span key={fact.id}>{fact.title}</span>)}</div> : <div className="memory-empty">Your lasting details will appear here after your first conversation.</div>}</section>
       </div>
       <div className="bottom-note"><Info size={15} /> Harbor is an AI care support prototype for practical navigation. It does not provide medical advice or arrange services for you.</div>
     </main>}

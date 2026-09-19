@@ -4,7 +4,7 @@ import type { Turn } from '../shared/types.js'
 
 export async function createSample(store: Store, visitorId: string): Promise<string> {
   const conversation = await store.create(visitorId, {
-    provider: 'openai', mode: 'family', style: 'gentle', pace: 'unhurried', focus: 'everyday', voice: 'marin',
+    provider: 'openai', mode: 'patient', style: 'gentle', pace: 'unhurried', focus: 'everyday', voice: 'marin',
   })
   const utterances = [
     ['assistant', 'Hi, I’m Harbor, an AI care navigator. What would be useful to talk through today?'],

@@ -29,7 +29,7 @@ const analysis = startAnalysis(store)
 const activeVoices = new Map<string, VoiceSession | GeminiSession>()
 const settingsSchema = z.object({
   provider: z.enum(['openai', 'gemini']),
-  mode: z.enum(['patient', 'family']), style: z.enum(['gentle', 'direct']),
+  mode: z.literal('patient'), style: z.enum(['gentle', 'direct']),
   pace: z.enum(['unhurried', 'balanced']), focus: z.enum(['everyday', 'appointments', 'caregiver']),
   voice: z.enum(['marin', 'cedar', 'alloy', 'Kore', 'Aoede', 'Sulafat']),
 }).refine(value => value.provider === 'gemini'
@@ -61,7 +61,12 @@ app.get('/api/health', async () => ({ ok: true, providers: { openai: Boolean(pro
 
 app.get('/api/bootstrap', async (request, reply) => {
   const visitorId = await identity(request, reply)
-  return { visitorId, providers: { openai: Boolean(process.env.OPENAI_API_KEY), gemini: Boolean(process.env.GEMINI_API_KEY) }, conversations: await store.list(visitorId) }
+  return { visitorId, providers: { openai: Boolean(process.env.OPENAI_API_KEY), gemini: Boolean(process.env.GEMINI_API_KEY) }, conversations: await store.list(visitorId), profile: await store.profile(visitorId) }
+})
+
+app.get('/api/profile', async (request, reply) => {
+  const visitorId = await identity(request, reply)
+  return store.profile(visitorId)
 })
 
 app.post('/api/conversations', async (request, reply) => {

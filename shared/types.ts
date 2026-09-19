@@ -69,3 +69,10 @@ export interface ConversationDetail {
   widgets: WidgetState[]
   events: AppEvent[]
 }
+
+/** Longitudinal patient memory shared by every conversation in this browser profile. */
+export interface PatientProfile {
+  facts: Fact[]
+  conversation_count: number
+  last_activity: string | null
+}

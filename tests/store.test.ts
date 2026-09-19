@@ -34,6 +34,9 @@ test('visitor isolation, atomic turn jobs, correction, and deletion', async () =
   const corrected = await store.correctFact(fact.id, owner.id, 'Nina is unavailable on Tuesday')
   assert.equal(corrected?.supersedes_id, fact.id)
   assert.equal((await store.facts(conversation.id)).find(item => item.id === fact.id)?.status, 'corrected')
+  const profile = await store.profile(owner.id)
+  assert.equal(profile.conversation_count, 1)
+  assert.equal(profile.facts.some(item => item.detail === 'Nina is unavailable on Tuesday'), true)
   assert.equal((await store.pendingJobs()).length, 8)
   assert.equal(published.filter(event => event.type === 'turn').length, 2)
   const auto = await store.replaceFact(corrected!.id, { conversation_id: conversation.id, widget: 'circle',
