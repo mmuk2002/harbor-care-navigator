@@ -1,13 +1,15 @@
 export const widgetIds = ['circle', 'timeline', 'needs', 'steps'] as const
 export type WidgetId = typeof widgetIds[number]
 export type Mode = 'patient' | 'family'
+export type Provider = 'openai' | 'gemini'
 
 export interface Settings {
+  provider: Provider
   mode: Mode
   style: 'gentle' | 'direct'
   pace: 'unhurried' | 'balanced'
   focus: 'everyday' | 'appointments' | 'caregiver'
-  voice: 'marin' | 'cedar' | 'alloy'
+  voice: 'marin' | 'cedar' | 'alloy' | 'Kore' | 'Aoede' | 'Sulafat'
 }
 
 export interface Conversation {

@@ -1,10 +1,11 @@
 import WebSocket from 'ws'
+import OpenAI from 'openai'
 import type { Settings } from '../shared/types.js'
 import type { Store } from './store.js'
 
 const realtimeModel = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1'
 
-function instructions(settings: Settings, memory: string): string {
+export function instructions(settings: Settings, memory: string): string {
   return `You are Harbor, a clearly disclosed AI care navigation assistant. You are not a clinician.
 You are speaking with ${settings.mode === 'patient' ? 'a patient' : 'a family member or caregiver'}.
 Ask one useful question at a time. Be patient, respectful, never infantilizing, and leave room for long pauses.
@@ -18,8 +19,10 @@ Use prior information sparingly and ask whether open plans changed. If the calle
 
 export class VoiceSession {
   private socket: WebSocket | null = null
-  private partials = new Map<string, string>()
-  constructor(private store: Store, private onTurn: () => void) {}
+  private callId: string | null = null
+  private expiry: ReturnType<typeof setTimeout> | null = null
+  constructor(private store: Store, private onTurn: () => void,
+    private onExpire: () => Promise<void>, private onDisconnect: () => Promise<void>) {}
 
   async connect(conversationId: string, sdp: string, settings: Settings, memory: string): Promise<string> {
     const apiKey = process.env.OPENAI_API_KEY
@@ -42,8 +45,12 @@ export class VoiceSession {
     const answer = await response.text()
     const callId = response.headers.get('Location')?.split('/').pop()
     if (!callId) throw new Error('Voice provider returned no call ID for observation')
+    this.callId = callId
     await this.attach(callId, conversationId, apiKey)
     await this.store.setConversation(conversationId, 'live', callId)
+    this.expiry = setTimeout(() => {
+      void this.close().then(this.onExpire).catch(error => console.error('Voice session expiry failed', error))
+    }, 10 * 60 * 1000)
     return answer
   }
 
@@ -64,16 +71,18 @@ export class VoiceSession {
       })
     })
     socket.on('close', () => {
-      if (this.socket === socket) void this.store.event(conversationId, 'error', { message: 'Live transcript observation disconnected.' })
+      if (this.socket === socket) {
+        void this.store.event(conversationId, 'error', { message: 'Live transcript observation disconnected.' })
+        void this.close().then(this.onDisconnect).catch(error => console.error('Voice disconnect cleanup failed', error))
+      }
     })
   }
 
   private async onProviderEvent(conversationId: string, event: Record<string, unknown>): Promise<void> {
     const type = String(event.type || '')
     const itemId = String(event.item_id || (event.item as { id?: string } | undefined)?.id || event.response_id || '')
-    if (type.endsWith('.delta') && type.includes('transcript')) {
-      const prior = this.partials.get(`${type}:${itemId}`) || ''
-      this.partials.set(`${type}:${itemId}`, prior + String(event.delta || ''))
+    if (type === 'error') {
+      await this.store.event(conversationId, 'error', { message: 'Voice service reported an error.' })
       return
     }
     const userDone = type === 'conversation.item.input_audio_transcription.completed' ||
@@ -91,5 +100,17 @@ export class VoiceSession {
     }
   }
 
-  close(): void { const socket = this.socket; this.socket = null; socket?.close() }
+  async close(): Promise<void> {
+    if (this.expiry) clearTimeout(this.expiry)
+    this.expiry = null
+    const socket = this.socket
+    this.socket = null
+    socket?.close()
+    const callId = this.callId
+    this.callId = null
+    if (callId && process.env.OPENAI_API_KEY) {
+      try { await new OpenAI({ apiKey: process.env.OPENAI_API_KEY }).realtime.calls.hangup(callId) }
+      catch (error) { console.error('Voice hangup failed', error) }
+    }
+  }
 }

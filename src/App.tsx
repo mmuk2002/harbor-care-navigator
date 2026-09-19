@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity, ArrowLeft, ArrowRight, AudioLines, CalendarDays, CheckCircle2,
   ChevronRight, Clock3, HeartHandshake, History, Info, LayoutGrid, Mic, MicOff,
   Play, Send, Settings2, ShieldCheck, Sparkles, Square, Users, Volume2, X,
 } from 'lucide-react'
 import type { Conversation, ConversationDetail, Fact, Settings, Turn, WidgetId } from '../shared/types'
+import { GeminiAudio } from './geminiAudio'
 
-const defaultSettings: Settings = { mode: 'family', style: 'gentle', pace: 'unhurried', focus: 'everyday', voice: 'marin' }
+const defaultSettings: Settings = { provider: 'openai', mode: 'family', style: 'gentle', pace: 'unhurried', focus: 'everyday', voice: 'marin' }
 const widgetMeta: Record<WidgetId, { title: string; subtitle: string; icon: typeof Users; color: string }> = {
   circle: { title: 'Care circle', subtitle: 'People who matter', icon: Users, color: 'blue' },
   timeline: { title: 'Care timeline', subtitle: 'Events and plans', icon: CalendarDays, color: 'amber' },
@@ -17,7 +18,7 @@ const widgetOrder: WidgetId[] = ['circle', 'timeline', 'needs', 'steps']
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
-    ...init, headers: { 'Content-Type': 'application/json', ...init?.headers }, credentials: 'same-origin',
+    ...init, headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...init?.headers }, credentials: 'same-origin',
   })
   if (!response.ok) {
     const payload = await response.json().catch(() => ({})) as { error?: string }
@@ -42,7 +43,8 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>(defaultSettings)
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [detail, setDetail] = useState<ConversationDetail | null>(null)
-  const [voiceConfigured, setVoiceConfigured] = useState(false)
+  const [providers, setProviders] = useState({ openai: false, gemini: false })
+  const voiceConfigured = providers[settings.provider]
   const [page, setPage] = useState<'home' | 'call' | 'workspace' | 'history'>('home')
   const [callState, setCallState] = useState<'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'ended'>('idle')
   const [muted, setMuted] = useState(false)
@@ -58,6 +60,9 @@ export default function App() {
   const channel = useRef<RTCDataChannel | null>(null)
   const stream = useRef<MediaStream | null>(null)
   const player = useRef<HTMLAudioElement | null>(null)
+  const geminiSocket = useRef<WebSocket | null>(null)
+  const geminiAudio = useRef<GeminiAudio | null>(null)
+  const ending = useRef(false)
   const socket = useRef<WebSocket | null>(null)
   const activeId = useRef<string | null>(null)
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -75,28 +80,38 @@ export default function App() {
     setPage(target)
     socket.current?.close()
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${protocol}//${location.host}/events?conversation=${encodeURIComponent(id)}`)
-    socket.current = ws
-    ws.onmessage = () => {
-      if (refreshTimer.current) clearTimeout(refreshTimer.current)
-      refreshTimer.current = setTimeout(() => { void refresh(id).catch(setErrorFromUnknown) }, 80)
+    const connectEvents = () => {
+      if (activeId.current !== id) return
+      const ws = new WebSocket(`${protocol}//${location.host}/events?conversation=${encodeURIComponent(id)}`)
+      socket.current = ws
+      ws.onopen = () => setStatus(current => current === 'Live updates disconnected. Reconnectingâ€¦' ? 'Live updates restored.' : current)
+      ws.onmessage = () => {
+        if (refreshTimer.current) clearTimeout(refreshTimer.current)
+        refreshTimer.current = setTimeout(() => { void refresh(id).catch(setErrorFromUnknown) }, 80)
+      }
+      ws.onclose = () => {
+        if (activeId.current !== id || socket.current !== ws) return
+        setStatus('Live updates disconnected. Reconnectingâ€¦')
+        setTimeout(connectEvents, 2000)
+      }
     }
-    ws.onclose = () => { if (activeId.current === id) setStatus('Live updates disconnected. Saved history remains available.') }
+    connectEvents()
   }, [refresh])
 
   function setErrorFromUnknown(value: unknown) { setError(value instanceof Error ? value.message : String(value)) }
 
   useEffect(() => {
-    void api<{ conversations: Conversation[]; voiceConfigured: boolean }>('/api/bootstrap')
-      .then(data => { setConversations(data.conversations); setVoiceConfigured(data.voiceConfigured) })
+    void api<{ conversations: Conversation[]; providers: { openai: boolean; gemini: boolean } }>('/api/bootstrap')
+      .then(data => { setConversations(data.conversations); setProviders(data.providers)
+        if (!data.providers.openai && data.providers.gemini) setSettings(value => ({ ...value, provider: 'gemini', voice: 'Kore' })) })
       .catch(setErrorFromUnknown)
     const timer = setInterval(() => setTick(value => value + 1), 1000)
-    return () => { clearInterval(timer); socket.current?.close(); connection.current?.close(); stream.current?.getTracks().forEach(track => track.stop()) }
+    return () => { clearInterval(timer); socket.current?.close(); connection.current?.close(); geminiSocket.current?.close(); geminiAudio.current?.close(); stream.current?.getTracks().forEach(track => track.stop()) }
   }, [])
 
   async function start(): Promise<void> {
     setError('')
-    setStatus('Preparing a private conversation…')
+    setStatus('Preparing a private conversationâ€¦')
     setCallState('connecting')
     let created: Conversation | null = null
     try {
@@ -105,11 +120,18 @@ export default function App() {
       await openConversation(created.id)
       if (!voiceConfigured) {
         setCallState('idle')
-        setStatus('Text sandbox is ready. Add an OpenAI key to enable live voice.')
+        setStatus(`Text sandbox is ready. Add a ${settings.provider === 'gemini' ? 'Gemini' : 'OpenAI'} key to enable live voice.`)
         return
       }
       const microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
       stream.current = microphone
+
+      if (settings.provider === 'gemini') {
+        await startGemini(created.id, microphone)
+        setCallState('listening')
+        setStatus('Transcript saving â€¢ Take your time')
+        return
+      }
       const pc = new RTCPeerConnection()
       connection.current = pc
       for (const track of microphone.getTracks()) pc.addTrack(track, microphone)
@@ -132,7 +154,7 @@ export default function App() {
       })
       await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp })
       setCallState('listening')
-      setStatus('Transcript saving • Take your time')
+      setStatus('Transcript saving â€¢ Take your time')
     } catch (cause) {
       cleanupMedia()
       setCallState('idle')
@@ -141,7 +163,51 @@ export default function App() {
     }
   }
 
+  async function startGemini(id: string, microphone: MediaStream): Promise<void> {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const ws = new WebSocket(`${protocol}//${location.host}/gemini?conversation=${encodeURIComponent(id)}`)
+    geminiSocket.current = ws
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Gemini Live connection timed out')), 15000)
+      ws.onmessage = event => {
+        const message = JSON.parse(event.data) as { type: string; data?: string; message?: string }
+        if (message.type === 'ready') { clearTimeout(timer); resolve(); return }
+        if (message.type === 'error') { clearTimeout(timer); reject(new Error(message.message || 'Gemini Live error')); return }
+        if (message.type === 'audio' && message.data) { geminiAudio.current?.play(message.data); setCallState('speaking') }
+        if (message.type === 'interrupted') { geminiAudio.current?.interrupt(); setCallState('listening') }
+        if (message.type === 'listening') setCallState('listening')
+        if (message.type === 'speaking') setCallState('speaking')
+      }
+      ws.onerror = () => { clearTimeout(timer); reject(new Error('Gemini Live network connection failed')) }
+      ws.onclose = () => {
+        clearTimeout(timer)
+        if (!ending.current && geminiSocket.current === ws) {
+          setStatus('Voice connection ended. Your saved conversation is available.')
+          setCallState('ended')
+          void refresh(id).catch(setErrorFromUnknown)
+        }
+      }
+    })
+    const audio = new GeminiAudio(microphone, ws)
+    geminiAudio.current = audio
+    await audio.start()
+  }
+
+  async function openSample(): Promise<void> {
+    setError('')
+    try {
+      const { id } = await api<{ id: string }>('/api/sample', { method: 'POST' })
+      const bootstrap = await api<{ conversations: Conversation[] }>('/api/bootstrap')
+      setConversations(bootstrap.conversations)
+      await openConversation(id, 'workspace')
+    } catch (cause) { setErrorFromUnknown(cause) }
+  }
+
   function cleanupMedia(): void {
+    geminiAudio.current?.close()
+    geminiAudio.current = null
+    geminiSocket.current?.close()
+    geminiSocket.current = null
     stream.current?.getTracks().forEach(track => track.stop())
     stream.current = null
     player.current?.pause()
@@ -151,17 +217,27 @@ export default function App() {
     channel.current = null
   }
 
+  function toggleMute(): void {
+    const next = !muted
+    if (detail?.conversation.settings.provider === 'gemini') geminiAudio.current?.mute(next)
+    else stream.current?.getAudioTracks().forEach(track => { track.enabled = !next })
+    setMuted(next)
+  }
+
   async function end(): Promise<void> {
-    cleanupMedia()
+    ending.current = true
+    if (detail?.conversation.settings.provider !== 'gemini') cleanupMedia()
     setCallState('ended')
-    setStatus('Finishing saved conversation…')
+    setStatus('Finishing saved conversationâ€¦')
     if (!activeId.current) return
     try {
       await api(`/api/conversations/${activeId.current}/end`, { method: 'POST' })
+      cleanupMedia()
       await refresh(activeId.current)
       setConversations(await api<{ conversations: Conversation[] }>('/api/bootstrap').then(value => value.conversations))
       setStatus('Conversation saved')
-    } catch (cause) { setErrorFromUnknown(cause); setStatus('Could not confirm final save') }
+    } catch (cause) { cleanupMedia(); setErrorFromUnknown(cause); setStatus('Could not confirm final save') }
+    finally { ending.current = false }
   }
 
   async function sendText(): Promise<void> {
@@ -229,7 +305,7 @@ export default function App() {
             <button onClick={() => openSource(fact.source_turn_id)}>View source <ChevronRight size={13} /></button>
             {replayIndex === null && <button onClick={() => { setEditingFact(fact.id); setEditValue(fact.detail) }}>Correct</button>}
           </div></>}
-        </article>) : <div className="empty-widget"><span className="empty-dash">✦</span><p>{widget === 'circle' ? 'People and helpers will appear here.' : widget === 'timeline' ? 'Important events will take shape here.' : widget === 'needs' ? 'We’ll keep track of what matters.' : 'Agreed actions will stay visible here.'}</p></div>}
+        </article>) : <div className="empty-widget"><span className="empty-dash">âœ¦</span><p>{widget === 'circle' ? 'People and helpers will appear here.' : widget === 'timeline' ? 'Important events will take shape here.' : widget === 'needs' ? 'Weâ€™ll keep track of what matters.' : 'Agreed actions will stay visible here.'}</p></div>}
       </div>
       {state?.duration_ms != null && <div className="widget-foot">Updated in {(state.duration_ms / 1000).toFixed(1)}s</div>}
     </section>
@@ -237,36 +313,44 @@ export default function App() {
 
   const latestSteps = useMemo(() => detail?.facts.filter(f => f.widget === 'steps' && f.status !== 'corrected').slice(-3) || [], [detail])
   const currentConversation = detail?.conversation
-  const isActive = currentConversation?.status === 'live' || callState === 'connecting' || (currentConversation?.status === 'ready' && !voiceConfigured)
+  const isActive = currentConversation?.status === 'live' || currentConversation?.status === 'ready' || callState === 'connecting'
 
   return <div className="app-shell">
     <header className="site-header">
       <button className="brand" onClick={() => setPage('home')} aria-label="Harbor home"><span className="brand-mark"><AudioLines size={21} /></span><span>harbor<span className="brand-period">.</span></span></button>
       <nav aria-label="Main navigation"><button className={page === 'home' ? 'nav-active' : ''} onClick={() => setPage('home')}>Home</button><button className={page === 'history' ? 'nav-active' : ''} onClick={() => setPage('history')}><History size={15} /> Conversations</button></nav>
-      <span className="header-note"><span className="header-heart">●</span> Here to help, one step at a time</span>
+      <span className="header-note"><span className="header-heart">â—</span> Here to help, one step at a time</span>
     </header>
 
     {error && <div className="error-banner" role="alert"><Info size={17} /><span>{error}</span><button onClick={() => setError('')} aria-label="Dismiss error"><X size={17} /></button></div>}
 
     {page === 'home' && <main className="home-main">
-      <div className="hero-copy"><div className="eyebrow"><Sparkles size={14} /> A calmer way forward</div><h1>Every conversation<br /><em>moves care forward.</em></h1><p>A gentle place to talk through what’s happening, remember what matters, and find one clear next step.</p><div className="hero-actions"><button className="primary-button" onClick={() => void start()} disabled={callState === 'connecting'}><Mic size={18} />{voiceConfigured ? 'Start a conversation' : 'Open text sandbox'}<ArrowRight size={18} /></button><span className="privacy-caption"><ShieldCheck size={16} /> Your conversation is saved privately</span></div></div>
+      <div className="hero-copy"><div className="eyebrow"><Sparkles size={14} /> A calmer way forward</div><h1>Every conversation<br /><em>moves care forward.</em></h1><p>Harbor is an AI, non-clinical care navigator. Talk through whatâ€™s happening, remember what matters, and find one clear next step.</p><div className="hero-actions"><button className="primary-button" onClick={() => void start()} disabled={callState === 'connecting'}><Mic size={18} />{voiceConfigured ? 'Start a conversation' : 'Open text sandbox'}<ArrowRight size={18} /></button><span className="privacy-caption"><ShieldCheck size={16} /> Your conversation is saved privately</span></div><button className="sample-link" onClick={() => void openSample()}><Play size={15} /> Explore a fictional sample conversation</button></div>
       <div className="hero-art" aria-hidden="true"><div className="hero-ring outer" /><div className="hero-ring mid" /><div className="hero-ring inner" /><div className="hero-orb"><AudioLines size={57} strokeWidth={1.4} /></div><span className="orbit-label orbit-one">A little clarity</span><span className="orbit-label orbit-two">One step at a time</span></div>
       <div className="home-bottom">
-        <section className="settings-panel"><div className="section-kicker"><Settings2 size={15} /> MAKE IT YOURS</div><h2>How would you like to talk?</h2><p>Choose what feels comfortable. You can change this before each conversation.</p><div className="setting-row"><label>I’m here as</label><div className="segmented"><button className={settings.mode === 'family' ? 'selected' : ''} onClick={() => setSettings({ ...settings, mode: 'family' })}>Family or caregiver</button><button className={settings.mode === 'patient' ? 'selected' : ''} onClick={() => setSettings({ ...settings, mode: 'patient' })}>Patient</button></div></div><div className="settings-grid"><label>Conversation style<select value={settings.style} onChange={event => setSettings({ ...settings, style: event.target.value as Settings['style'] })}><option value="gentle">Gentle & reassuring</option><option value="direct">Clear & concise</option></select></label><label>Speaking pace<select value={settings.pace} onChange={event => setSettings({ ...settings, pace: event.target.value as Settings['pace'] })}><option value="unhurried">Unhurried</option><option value="balanced">Balanced</option></select></label><label>Today’s focus<select value={settings.focus} onChange={event => setSettings({ ...settings, focus: event.target.value as Settings['focus'] })}><option value="everyday">Everyday support</option><option value="appointments">Appointments</option><option value="caregiver">Caregiver support</option></select></label><label>Voice<select value={settings.voice} onChange={event => setSettings({ ...settings, voice: event.target.value as Settings['voice'] })}><option value="marin">Marin</option><option value="cedar">Cedar</option><option value="alloy">Alloy</option></select></label></div></section>
-        <section className="recent-panel"><div className="section-kicker"><Clock3 size={15} /> CONTINUITY</div><h2>Pick up where you left off</h2><p>What you share can help the next conversation begin with context.</p>{conversations.length ? <div className="recent-list">{conversations.slice(0, 3).map(item => <button key={item.id} onClick={() => void openConversation(item.id, 'call')}><span className="recent-icon"><AudioLines size={18} /></span><span><strong>{item.settings.mode === 'patient' ? 'Patient' : 'Family'} conversation</strong><small>{readableDate(item.started_at)} · {item.status === 'ended' ? 'Saved' : item.status}</small></span><ChevronRight size={18} /></button>)}</div> : <div className="recent-empty"><span className="empty-sparkle">✦</span><strong>Your story starts here</strong><span>Conversations and next steps will appear in this space.</span></div>}</section>
+        <section className="settings-panel">
+          <div className="section-kicker"><Settings2 size={15} /> MAKE IT YOURS</div>
+          <h2>How would you like to talk?</h2>
+          <p>Choose what feels comfortable. You can change this before each conversation.</p>
+          <div className="setting-row"><label>Iâ€™m here as</label><div className="segmented"><button className={settings.mode === 'family' ? 'selected' : ''} onClick={() => setSettings({ ...settings, mode: 'family' })}>Family or caregiver</button><button className={settings.mode === 'patient' ? 'selected' : ''} onClick={() => setSettings({ ...settings, mode: 'patient' })}>Patient</button></div></div>
+          <div className="setting-row"><label>Voice service</label><div className="segmented"><button className={settings.provider === 'openai' ? 'selected' : ''} onClick={() => setSettings({ ...settings, provider: 'openai', voice: 'marin' })}>OpenAI {providers.openai ? '' : 'Â· setup needed'}</button><button className={settings.provider === 'gemini' ? 'selected' : ''} onClick={() => setSettings({ ...settings, provider: 'gemini', voice: 'Kore' })}>Gemini {providers.gemini ? '' : 'Â· setup needed'}</button></div></div>
+          <div className="settings-grid"><label>Conversation style<select value={settings.style} onChange={event => setSettings({ ...settings, style: event.target.value as Settings['style'] })}><option value="gentle">Gentle & reassuring</option><option value="direct">Clear & concise</option></select></label><label>Speaking pace<select value={settings.pace} onChange={event => setSettings({ ...settings, pace: event.target.value as Settings['pace'] })}><option value="unhurried">Unhurried</option><option value="balanced">Balanced</option></select></label><label>Todayâ€™s focus<select value={settings.focus} onChange={event => setSettings({ ...settings, focus: event.target.value as Settings['focus'] })}><option value="everyday">Everyday support</option><option value="appointments">Appointments</option><option value="caregiver">Caregiver support</option></select></label><label>Voice<select value={settings.voice} onChange={event => setSettings({ ...settings, voice: event.target.value as Settings['voice'] })}>{settings.provider === 'gemini' ? <><option value="Kore">Kore Â· steady</option><option value="Aoede">Aoede Â· light</option><option value="Sulafat">Sulafat Â· warm</option></> : <><option value="marin">Marin</option><option value="cedar">Cedar</option><option value="alloy">Alloy</option></>}</select></label></div>
+          {settings.provider === 'gemini' && <p className="provider-note">Geminiâ€™s free tier may use conversation data to improve Google products. Use fictional details for this demo.</p>}
+        </section>
+        <section className="recent-panel"><div className="section-kicker"><Clock3 size={15} /> CONTINUITY</div><h2>Pick up where you left off</h2><p>What you share can help the next conversation begin with context.</p>{conversations.length ? <div className="recent-list">{conversations.slice(0, 3).map(item => <button key={item.id} onClick={() => void openConversation(item.id, 'call')}><span className="recent-icon"><AudioLines size={18} /></span><span><strong>{item.settings.mode === 'patient' ? 'Patient' : 'Family'} conversation</strong><small>{readableDate(item.started_at)} Â· {item.status === 'ended' ? 'Saved' : item.status}</small></span><ChevronRight size={18} /></button>)}</div> : <div className="recent-empty"><span className="empty-sparkle">âœ¦</span><strong>Your story starts here</strong><span>Conversations and next steps will appear in this space.</span></div>}</section>
       </div>
       <div className="bottom-note"><Info size={15} /> Harbor is an AI care support prototype for practical navigation. It does not provide medical advice or arrange services for you.</div>
     </main>}
 
-    {page === 'history' && <main className="history-main"><button className="back-link" onClick={() => setPage('home')}><ArrowLeft size={17} /> Back home</button><div className="page-heading"><div className="section-kicker">YOUR CONVERSATIONS</div><h1>A place to remember<br /><em>what matters.</em></h1><p>Revisit a conversation and the details that came from it.</p></div>{conversations.length ? <div className="history-list">{conversations.map(item => <button key={item.id} onClick={() => void openConversation(item.id, 'call')}><span className="history-icon"><AudioLines size={21} /></span><span className="history-text"><strong>{item.settings.mode === 'patient' ? 'Patient' : 'Family'} conversation</strong><small>{readableDate(item.started_at)} at {readableTime(item.started_at)}</small></span><span className="history-status">{item.status === 'ended' ? 'Saved' : item.status}</span><ArrowRight size={19} /></button>)}</div> : <div className="history-empty">No conversations yet. Start one when you’re ready.</div>}</main>}
+    {page === 'history' && <main className="history-main"><button className="back-link" onClick={() => setPage('home')}><ArrowLeft size={17} /> Back home</button><div className="page-heading"><div className="section-kicker">YOUR CONVERSATIONS</div><h1>A place to remember<br /><em>what matters.</em></h1><p>Revisit a conversation and the details that came from it.</p></div>{conversations.length ? <div className="history-list">{conversations.map(item => <button key={item.id} onClick={() => void openConversation(item.id, 'call')}><span className="history-icon"><AudioLines size={21} /></span><span className="history-text"><strong>{item.settings.mode === 'patient' ? 'Patient' : 'Family'} conversation</strong><small>{readableDate(item.started_at)} at {readableTime(item.started_at)}</small></span><span className="history-status">{item.status === 'ended' ? 'Saved' : item.status}</span><ArrowRight size={19} /></button>)}</div> : <div className="history-empty">No conversations yet. Start one when youâ€™re ready.</div>}</main>}
 
     {(page === 'call' || page === 'workspace') && currentConversation && <main className="session-main">
-      <div className="session-header"><button className="back-link" onClick={() => setPage('home')}><ArrowLeft size={17} /> Back home</button><div className="session-title"><span className="session-kicker">{currentConversation.settings.mode === 'patient' ? 'PATIENT' : 'FAMILY'} CONVERSATION</span><h1>{currentConversation.status === 'ended' ? 'A conversation to keep.' : 'Take your time. I’m here.'}</h1><p>{currentConversation.status === 'ended' ? readableDate(currentConversation.started_at) : 'We can take this one step at a time.'}</p></div><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" onClick={() => void removeConversation()}><X size={18} /></button></div>
+      <div className="session-header"><button className="back-link" onClick={() => setPage('home')}><ArrowLeft size={17} /> Back home</button><div className="session-title"><span className="session-kicker">{currentConversation.settings.mode === 'patient' ? 'PATIENT' : 'FAMILY'} CONVERSATION</span><h1>{currentConversation.status === 'ended' ? 'A conversation to keep.' : 'Take your time. Iâ€™m here.'}</h1><p>{currentConversation.status === 'ended' ? readableDate(currentConversation.started_at) : 'We can take this one step at a time.'}</p></div><button className="icon-button" title="Delete conversation" aria-label="Delete conversation" onClick={() => void removeConversation()}><X size={18} /></button></div>
       <div className="session-tabs" role="tablist"><button role="tab" aria-selected={page === 'call'} className={page === 'call' ? 'selected' : ''} onClick={() => setPage('call')}><AudioLines size={17} /> Conversation</button><button role="tab" aria-selected={page === 'workspace'} className={page === 'workspace' ? 'selected' : ''} onClick={() => setPage('workspace')}><LayoutGrid size={17} /> Live workspace <span className="tab-badge">4</span></button></div>
 
-      {page === 'call' && <div className="call-layout"><section className="call-surface"><div className="call-top"><div className="live-state"><span className={`live-dot ${isActive ? 'pulse' : ''}`} />{currentConversation.status === 'ended' ? 'Conversation saved' : callState === 'connecting' ? 'Connecting' : voiceConfigured ? 'Live conversation' : 'Text sandbox'}</div><span className="call-timer"><Clock3 size={16} />{currentConversation.status === 'ended' && currentConversation.ended_at ? readableTime(currentConversation.ended_at) : durationSince(currentConversation.started_at)}{void tick}</span></div><div className={`call-orb ${callState}`}><div className="orb-wave a" /><div className="orb-wave b" /><span className="orb-center"><AudioLines size={48} strokeWidth={1.35} /></span></div><h2>{currentConversation.status === 'ended' ? 'Thank you for sharing.' : callState === 'speaking' ? 'Harbor is speaking' : callState === 'thinking' ? 'Thinking with you…' : callState === 'connecting' ? 'Finding a connection…' : 'I’m listening.'}</h2><p className="call-guidance">{status || 'You can talk naturally. There is no rush.'}</p><div className="call-controls">{voiceConfigured && currentConversation.status === 'live' && <button className={`round-control ${muted ? 'muted' : ''}`} title={muted ? 'Unmute microphone' : 'Mute microphone'} aria-label={muted ? 'Unmute microphone' : 'Mute microphone'} onClick={() => { stream.current?.getAudioTracks().forEach(track => { track.enabled = muted }); setMuted(!muted) }}>{muted ? <MicOff size={22} /> : <Mic size={22} />}</button>}{voiceConfigured && currentConversation.status === 'live' && <button className="round-control" title="Play voice output" aria-label="Play voice output" onClick={() => void player.current?.play()}><Volume2 size={22} /></button>}{isActive && <button className="end-control" onClick={() => void end()}><Square size={15} fill="currentColor" /> End conversation</button>}{currentConversation.status === 'ended' && <button className="outline-control" onClick={() => setPage('workspace')}>Review what we heard <ArrowRight size={16} /></button>}</div>{!voiceConfigured && currentConversation.status !== 'ended' && <div className="sandbox-entry"><label htmlFor="sandbox-text">Explore with text while live voice is being connected</label><div><input id="sandbox-text" value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void sendText() }} placeholder="I help my dad, and he needs a ride Tuesday…" /><button aria-label="Send text" onClick={() => void sendText()}><Send size={18} /></button></div></div>}</section><aside className="call-side"><div className="side-heading"><span className="section-kicker"><Sparkles size={14} /> THE THREAD</span><h2>What we’re holding onto</h2><p>These details can help your next conversation start with understanding.</p></div><div className="mini-transcript">{detail.turns.length ? detail.turns.slice(-5).map(turn => <div key={turn.id} className={`mini-turn ${turn.speaker}`}><span>{turn.speaker === 'user' ? 'You' : 'Harbor'}</span><p>{turn.text}</p></div>) : <div className="mini-empty">Your conversation will appear here as it unfolds.</div>}</div><div className="next-actions"><div><CheckCircle2 size={18} /><strong>Next steps</strong></div>{latestSteps.length ? latestSteps.map(fact => <p key={fact.id}>{fact.detail}</p>) : <p>We’ll collect any agreed next steps here.</p>}</div></aside></div>}
+      {page === 'call' && <div className="call-layout"><section className="call-surface"><div className="call-top"><div className="live-state"><span className={`live-dot ${isActive ? 'pulse' : ''}`} />{currentConversation.status === 'ended' ? 'Conversation saved' : callState === 'connecting' ? 'Connecting' : currentConversation.status === 'live' ? 'Live conversation' : voiceConfigured ? 'Voice not connected' : 'Text sandbox'}</div><span className="call-timer"><Clock3 size={16} />{currentConversation.status === 'ended' && currentConversation.ended_at ? readableTime(currentConversation.ended_at) : durationSince(currentConversation.started_at)}{void tick}</span></div><div className={`call-orb ${callState}`}><div className="orb-wave a" /><div className="orb-wave b" /><span className="orb-center"><AudioLines size={48} strokeWidth={1.35} /></span></div><h2>{currentConversation.status === 'ended' ? 'Thank you for sharing.' : callState === 'speaking' ? 'Harbor is speaking' : callState === 'thinking' ? 'Thinking with youâ€¦' : callState === 'connecting' ? 'Finding a connectionâ€¦' : 'Iâ€™m listening.'}</h2><p className="call-guidance">{status || 'You can talk naturally. There is no rush.'}</p><div className="call-controls">{voiceConfigured && currentConversation.status === 'live' && <button className={`round-control ${muted ? 'muted' : ''}`} title={muted ? 'Unmute microphone' : 'Mute microphone'} aria-label={muted ? 'Unmute microphone' : 'Mute microphone'} onClick={toggleMute}>{muted ? <MicOff size={22} /> : <Mic size={22} />}</button>}{voiceConfigured && currentConversation.status === 'live' && <button className="round-control" title="Play voice output" aria-label="Play voice output" onClick={() => void (currentConversation.settings.provider === 'gemini' ? geminiAudio.current?.resumeOutput() : player.current?.play())}><Volume2 size={22} /></button>}{isActive && <button className="end-control" onClick={() => void end()}><Square size={15} fill="currentColor" /> End conversation</button>}{currentConversation.status === 'ended' && <button className="outline-control" onClick={() => setPage('workspace')}>Review what we heard <ArrowRight size={16} /></button>}</div>{!voiceConfigured && currentConversation.status !== 'ended' && <div className="sandbox-entry"><label htmlFor="sandbox-text">Explore with text while live voice is being connected</label><div><input id="sandbox-text" value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void sendText() }} placeholder="I help my dad, and he needs a ride Tuesdayâ€¦" /><button aria-label="Send text" onClick={() => void sendText()}><Send size={18} /></button></div></div>}</section><aside className="call-side"><div className="side-heading"><span className="section-kicker"><Sparkles size={14} /> THE THREAD</span><h2>What weâ€™re holding onto</h2><p>These details can help your next conversation start with understanding.</p></div><div className="mini-transcript">{detail.turns.length ? detail.turns.slice(-5).map(turn => <div key={turn.id} className={`mini-turn ${turn.speaker}`}><span>{turn.speaker === 'user' ? 'You' : 'Harbor'}</span><p>{turn.text}</p></div>) : <div className="mini-empty">Your conversation will appear here as it unfolds.</div>}</div><div className="next-actions"><div><CheckCircle2 size={18} /><strong>Next steps</strong></div>{latestSteps.length ? latestSteps.map(fact => <p key={fact.id}>{fact.detail}</p>) : <p>Weâ€™ll collect any agreed next steps here.</p>}</div></aside></div>}
 
-      {page === 'workspace' && <div className="workspace-layout"><section className="transcript-panel"><div className="panel-heading"><div><span className="section-kicker">LIVE SESSION</span><h2>Conversation transcript</h2></div><span className={`stream-tag ${currentConversation.status === 'live' ? 'on' : ''}`}><span />{currentConversation.status === 'live' ? 'Streaming' : 'Saved'}</span></div><p className="transcript-intro">Every detail connects back to something said. Select a source on the right to see it here.</p><div className="transcript-list">{detail.turns.length ? detail.turns.map((turn: Turn) => <article id={`turn-${turn.id}`} key={turn.id} className={`transcript-turn ${turn.speaker} ${selectedSource === turn.id ? 'highlighted' : ''}`}><div className="turn-avatar">{turn.speaker === 'user' ? <Users size={16} /> : <AudioLines size={16} />}</div><div className="turn-content"><div className="turn-meta"><strong>{turn.speaker === 'user' ? 'You' : 'Harbor'}</strong><span>{readableTime(turn.created_at)}</span>{turn.interrupted && <span>Interrupted</span>}</div><p>{turn.text}</p></div></article>) : <div className="transcript-empty"><AudioLines size={28} /><p>The transcript will build here as the conversation continues.</p></div>}</div><div className="activity-panel"><div><Activity size={17} /><strong>Extraction activity</strong></div><p>{detail.facts.length} saved details · {detail.widgets.filter(widget => widget.status === 'working').length} processors updating</p><span>Each detail links to the words that support it.</span></div></section><section className="widgets-panel"><div className="widgets-heading"><div><span className="section-kicker">FOUR INDEPENDENT VIEWS</span><h2>What’s taking shape</h2></div><span className="update-caption"><span className="small-pulse" /> {currentConversation.status === 'live' ? 'Updating as you speak' : 'Saved from this session'}</span></div><div className="widget-grid">{widgetOrder.map(widget => widgetCard(widget))}</div><div className="replay-panel"><div><Play size={16} /><strong>Conversation replay</strong><span>Inspect what was known at each moment</span></div><input type="range" min="0" max={Math.max(0, detail.events.length - 1)} value={replayIndex ?? Math.max(0, detail.events.length - 1)} onChange={event => setReplayIndex(Number(event.target.value))} aria-label="Replay conversation events" /><small>{replayIndex === null || replayIndex === detail.events.length - 1 ? 'Latest state' : `Event ${replayIndex + 1} of ${detail.events.length}`}</small>{replayIndex !== null && <button className="text-button" onClick={() => setReplayIndex(null)}>Return to live</button>}</div></section></div>}
+      {page === 'workspace' && <div className="workspace-layout"><section className="transcript-panel"><div className="panel-heading"><div><span className="section-kicker">LIVE SESSION</span><h2>Conversation transcript</h2></div><span className={`stream-tag ${currentConversation.status === 'live' ? 'on' : ''}`}><span />{currentConversation.status === 'live' ? 'Streaming' : 'Saved'}</span></div><p className="transcript-intro">Every detail connects back to something said. Select a source on the right to see it here.</p><div className="transcript-list">{detail.turns.length ? detail.turns.map((turn: Turn) => <article id={`turn-${turn.id}`} key={turn.id} className={`transcript-turn ${turn.speaker} ${selectedSource === turn.id ? 'highlighted' : ''}`}><div className="turn-avatar">{turn.speaker === 'user' ? <Users size={16} /> : <AudioLines size={16} />}</div><div className="turn-content"><div className="turn-meta"><strong>{turn.speaker === 'user' ? 'You' : 'Harbor'}</strong><span>{readableTime(turn.created_at)}</span>{turn.interrupted && <span>Interrupted</span>}</div><p>{turn.text}</p></div></article>) : <div className="transcript-empty"><AudioLines size={28} /><p>The transcript will build here as the conversation continues.</p></div>}</div><div className="activity-panel"><div><Activity size={17} /><strong>Extraction activity</strong></div><p>{detail.facts.length} saved details Â· {detail.widgets.filter(widget => widget.status === 'working').length} processors updating</p><span>Each detail links to the words that support it.</span></div></section><section className="widgets-panel"><div className="widgets-heading"><div><span className="section-kicker">FOUR INDEPENDENT VIEWS</span><h2>Whatâ€™s taking shape</h2></div><span className="update-caption"><span className="small-pulse" /> {currentConversation.status === 'live' ? 'Updating as you speak' : 'Saved from this session'}</span></div><div className="widget-grid">{widgetOrder.map(widget => widgetCard(widget))}</div><div className="replay-panel"><div><Play size={16} /><strong>Conversation replay</strong><span>Inspect what was known at each moment</span></div><input type="range" min="0" max={Math.max(0, detail.events.length - 1)} value={replayIndex ?? Math.max(0, detail.events.length - 1)} onChange={event => setReplayIndex(Number(event.target.value))} aria-label="Replay conversation events" /><small>{replayIndex === null || replayIndex === detail.events.length - 1 ? 'Latest state' : `Event ${replayIndex + 1} of ${detail.events.length}`}</small>{replayIndex !== null && <button className="text-button" onClick={() => setReplayIndex(null)}>Return to live</button>}</div></section></div>}
     </main>}
   </div>
 }

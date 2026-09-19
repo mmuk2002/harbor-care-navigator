@@ -23,6 +23,17 @@ export class Store {
     return r.rows
   }
 
+  async voiceCallsToday(visitorId: string): Promise<number> {
+    const result = await this.db.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM conversations WHERE visitor_id=$1 AND provider_call_id IS NOT NULL
+       AND started_at > now() - interval '24 hours'`, [visitorId])
+    return Number(result.rows[0]?.count || 0)
+  }
+
+  async recoverCalls(): Promise<void> {
+    await this.db.query("UPDATE conversations SET status='incomplete',ended_at=now() WHERE status IN ('connecting','live')")
+  }
+
   async create(visitorId: string, settings: Settings): Promise<Conversation> {
     const id = randomUUID()
     const r = await this.db.query<Conversation>(
@@ -39,6 +50,10 @@ export class Store {
   async conversation(id: string, visitorId: string): Promise<Conversation | null> {
     const r = await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1 AND visitor_id=$2', [id, visitorId])
     return r.rows[0] || null
+  }
+
+  async conversationInternal(id: string): Promise<Conversation | null> {
+    return (await this.db.query<Conversation>('SELECT * FROM conversations WHERE id=$1', [id])).rows[0] || null
   }
 
   async detail(id: string, visitorId: string): Promise<ConversationDetail | null> {
@@ -64,15 +79,16 @@ export class Store {
     return r.rows[0]
   }
 
-  async addTurn(conversationId: string, sourceId: string, speaker: Turn['speaker'], text: string): Promise<{ turn: Turn; changed: boolean }> {
+  async addTurn(conversationId: string, sourceId: string, speaker: Turn['speaker'], text: string,
+    interrupted = false): Promise<{ turn: Turn; changed: boolean }> {
     const normalized = text.trim().slice(0, 10000)
     if (!normalized) throw new Error('Empty transcript')
     const existing = await this.db.query<Turn>('SELECT * FROM turns WHERE conversation_id=$1 AND source_id=$2', [conversationId, sourceId])
     if (existing.rows[0]?.text === normalized) return { turn: existing.rows[0], changed: false }
     const r = await this.db.query<Turn>(
-      `INSERT INTO turns(id,conversation_id,source_id,speaker,text) VALUES($1,$2,$3,$4,$5)
-       ON CONFLICT(conversation_id,source_id) DO UPDATE SET text=EXCLUDED.text RETURNING *`,
-      [randomUUID(), conversationId, sourceId, speaker, normalized],
+      `INSERT INTO turns(id,conversation_id,source_id,speaker,text,interrupted) VALUES($1,$2,$3,$4,$5,$6)
+       ON CONFLICT(conversation_id,source_id) DO UPDATE SET text=EXCLUDED.text,interrupted=EXCLUDED.interrupted RETURNING *`,
+      [randomUUID(), conversationId, sourceId, speaker, normalized, interrupted],
     )
     const turn = r.rows[0]
     await this.event(conversationId, 'turn', turn)
@@ -127,6 +143,28 @@ export class Store {
     )
     await this.event(input.conversation_id, 'fact', r.rows[0])
     return r.rows[0]
+  }
+
+  async replaceFact(oldId: string, input: Omit<Fact, 'id' | 'created_at'>): Promise<Fact> {
+    const result = await this.db.transaction(async query => {
+      const old = (await query<Fact>('SELECT * FROM facts WHERE id=$1 AND conversation_id=$2 AND widget=$3 AND status<>$4',
+        [oldId, input.conversation_id, input.widget, 'corrected'])).rows[0]
+      if (!old) throw new Error('Source item is no longer current')
+      await query('UPDATE facts SET status=$2 WHERE id=$1', [oldId, 'corrected'])
+      const replacement = (await query<Fact>(
+        `INSERT INTO facts(id,conversation_id,widget,title,detail,status,source_turn_id,source_quote,supersedes_id)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [randomUUID(), input.conversation_id, input.widget, input.title, input.detail, input.status,
+          input.source_turn_id, input.source_quote, oldId])).rows[0]
+      const events: AppEvent[] = []
+      for (const data of [{ ...old, status: 'corrected' }, replacement]) {
+        events.push((await query<AppEvent>('INSERT INTO events(conversation_id,type,data) VALUES($1,$2,$3) RETURNING *',
+          [input.conversation_id, 'fact', JSON.stringify(data)])).rows[0])
+      }
+      return { replacement, events }
+    })
+    result.events.forEach(event => this.publish(event))
+    return result.replacement
   }
 
   async correctFact(id: string, visitorId: string, detail: string): Promise<Fact | null> {
@@ -185,8 +223,12 @@ export class Store {
     )).rows
   }
 
+  async recoverJobs(): Promise<void> {
+    await this.db.query("UPDATE analysis_jobs SET status='pending',updated_at=now() WHERE status='running'")
+  }
+
   async jobStatus(id: string, status: 'running' | 'done' | 'failed'): Promise<void> {
-    await this.db.query(`UPDATE analysis_jobs SET status=$2,attempts=attempts+1,updated_at=now() WHERE id=$1`, [id, status])
+    await this.db.query(`UPDATE analysis_jobs SET status=$2,attempts=attempts+CASE WHEN $2='running' THEN 1 ELSE 0 END,updated_at=now() WHERE id=$1`, [id, status])
   }
 
   async event(conversationId: string, type: AppEvent['type'], data: unknown): Promise<AppEvent> {

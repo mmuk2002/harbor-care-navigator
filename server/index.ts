@@ -11,6 +11,8 @@ import { openDatabase } from './db.js'
 import { Store } from './store.js'
 import { startAnalysis } from './analysis.js'
 import { VoiceSession } from './voice.js'
+import { GeminiSession } from './gemini.js'
+import { createSample } from './demo.js'
 
 if (existsSync('.env')) process.loadEnvFile('.env')
 
@@ -22,13 +24,17 @@ const store = new Store(db, (event: AppEvent) => {
   if (!peers) return
   for (const peer of peers) if (peer.readyState === WebSocket.OPEN) peer.send(JSON.stringify(event))
 })
+await store.recoverCalls()
 const analysis = startAnalysis(store)
-const activeVoices = new Map<string, VoiceSession>()
+const activeVoices = new Map<string, VoiceSession | GeminiSession>()
 const settingsSchema = z.object({
+  provider: z.enum(['openai', 'gemini']),
   mode: z.enum(['patient', 'family']), style: z.enum(['gentle', 'direct']),
   pace: z.enum(['unhurried', 'balanced']), focus: z.enum(['everyday', 'appointments', 'caregiver']),
-  voice: z.enum(['marin', 'cedar', 'alloy']),
-})
+  voice: z.enum(['marin', 'cedar', 'alloy', 'Kore', 'Aoede', 'Sulafat']),
+}).refine(value => value.provider === 'gemini'
+  ? ['Kore', 'Aoede', 'Sulafat'].includes(value.voice)
+  : ['marin', 'cedar', 'alloy'].includes(value.voice), { message: 'Voice is not available for the selected provider' })
 const idSchema = z.object({ id: z.uuid() })
 
 function cookieValue(header: string | undefined): string | undefined {
@@ -51,11 +57,11 @@ app.setErrorHandler((error, _request, reply) => {
   reply.code(known.statusCode || 500).send({ error: known.statusCode ? known.message : 'Something went wrong. Please try again.' })
 })
 
-app.get('/api/health', async () => ({ ok: true, voiceConfigured: Boolean(process.env.OPENAI_API_KEY), storage: process.env.DATABASE_URL ? 'postgres' : 'local' }))
+app.get('/api/health', async () => ({ ok: true, providers: { openai: Boolean(process.env.OPENAI_API_KEY), gemini: Boolean(process.env.GEMINI_API_KEY) }, storage: process.env.DATABASE_URL ? 'postgres' : 'local' }))
 
 app.get('/api/bootstrap', async (request, reply) => {
   const visitorId = await identity(request, reply)
-  return { visitorId, voiceConfigured: Boolean(process.env.OPENAI_API_KEY), conversations: await store.list(visitorId) }
+  return { visitorId, providers: { openai: Boolean(process.env.OPENAI_API_KEY), gemini: Boolean(process.env.GEMINI_API_KEY) }, conversations: await store.list(visitorId) }
 })
 
 app.post('/api/conversations', async (request, reply) => {
@@ -63,6 +69,12 @@ app.post('/api/conversations', async (request, reply) => {
   const settings = settingsSchema.parse(request.body) as Settings
   const conversation = await store.create(visitorId, settings)
   return reply.code(201).send(conversation)
+})
+
+app.post('/api/sample', async (request, reply) => {
+  const visitorId = await identity(request, reply)
+  const id = await createSample(store, visitorId)
+  return reply.code(201).send({ id })
 })
 
 app.get('/api/conversations/:id', async (request, reply) => {
@@ -77,20 +89,32 @@ app.post('/api/conversations/:id/connect', async (request, reply) => {
   const { id } = idSchema.parse(request.params)
   const conversation = await store.conversation(id, visitorId)
   if (!conversation) return reply.code(404).send({ error: 'Conversation not found' })
+  if ((conversation.settings.provider || 'openai') !== 'openai') return reply.code(409).send({ error: 'This conversation uses Gemini Live' })
+  if (!process.env.OPENAI_API_KEY) return reply.code(503).send({ error: 'OpenAI voice is not configured' })
   if (conversation.status !== 'ready') return reply.code(409).send({ error: 'This conversation has already started' })
+  if (activeVoices.size >= 4) return reply.code(429).send({ error: 'All live voice slots are busy. Please try again shortly.' })
+  if ((await store.voiceCallsToday(visitorId)) >= 8) return reply.code(429).send({ error: 'This demo visitor has reached the daily voice limit.' })
+  if ((await store.list(visitorId)).some(item => item.status === 'live'))
+    return reply.code(409).send({ error: 'End your active conversation before starting another.' })
   const { sdp } = z.object({ sdp: z.string().min(20).max(100000) }).parse(request.body)
   await store.setConversation(id, 'connecting')
   const prior = (await store.list(visitorId)).filter(c => c.id !== id).slice(0, 4)
   const memory = (await Promise.all(prior.map(c => store.facts(c.id))))
     .flat().filter(f => f.status !== 'corrected' && f.status !== 'proposed')
     .slice(-12).map(f => `${f.title}: ${f.detail}`).join('\n')
-  const voice = new VoiceSession(store, () => analysis.kick())
+  const voice = new VoiceSession(store, () => analysis.kick(), async () => {
+    activeVoices.delete(id)
+    await store.setConversation(id, 'ended')
+  }, async () => {
+    activeVoices.delete(id)
+    await store.setConversation(id, 'incomplete')
+  })
   try {
     const answer = await voice.connect(id, sdp, conversation.settings, memory)
     activeVoices.set(id, voice)
     return { sdp: answer }
   } catch (error) {
-    voice.close()
+    await voice.close()
     await store.setConversation(id, 'incomplete')
     return reply.code(502).send({ error: errorMessage(error) })
   }
@@ -113,7 +137,7 @@ app.post('/api/conversations/:id/end', async (request, reply) => {
   const { id } = idSchema.parse(request.params)
   const conversation = await store.conversation(id, visitorId)
   if (!conversation) return reply.code(404).send({ error: 'Conversation not found' })
-  activeVoices.get(id)?.close()
+  await activeVoices.get(id)?.close()
   activeVoices.delete(id)
   return store.setConversation(id, 'ended')
 })
@@ -132,15 +156,49 @@ app.delete('/api/conversations/:id', async (request, reply) => {
   const { id } = idSchema.parse(request.params)
   const conversation = await store.conversation(id, visitorId)
   if (!conversation) return reply.code(404).send({ error: 'Conversation not found' })
-  activeVoices.get(id)?.close()
+  await activeVoices.get(id)?.close()
   activeVoices.delete(id)
   await db.query('DELETE FROM conversations WHERE id=$1 AND visitor_id=$2', [id, visitorId])
   return reply.code(204).send()
 })
 
 const socketServer = new WebSocketServer({ noServer: true })
+const geminiSocketServer = new WebSocketServer({ noServer: true, maxPayload: 64_000 })
 app.server.on('upgrade', (request, socket, head) => {
   const url = new URL(request.url || '/', 'http://localhost')
+  if (url.pathname === '/gemini') {
+    void (async () => {
+      const visitorId = await identity(request)
+      const id = url.searchParams.get('conversation') || ''
+      const conversation = await store.conversation(id, visitorId)
+      if (!conversation || conversation.settings.provider !== 'gemini' || conversation.status !== 'ready' ||
+          !process.env.GEMINI_API_KEY || activeVoices.size >= 4 || await store.voiceCallsToday(visitorId) >= 8 ||
+          (await store.list(visitorId)).some(item => item.status === 'live')) { socket.destroy(); return }
+      await store.setConversation(id, 'connecting')
+      const prior = (await store.list(visitorId)).filter(item => item.id !== id).slice(0, 4)
+      const memory = (await Promise.all(prior.map(item => store.facts(item.id))))
+        .flat().filter(fact => fact.status !== 'corrected' && fact.status !== 'proposed')
+        .slice(-12).map(fact => `${fact.title}: ${fact.detail}`).join('\n')
+      geminiSocketServer.handleUpgrade(request, socket, head, peer => {
+        const session = new GeminiSession(store, () => analysis.kick(), async () => {
+          activeVoices.delete(id)
+          await store.setConversation(id, 'ended')
+        }, async () => {
+          activeVoices.delete(id)
+          await store.setConversation(id, 'incomplete')
+        })
+        activeVoices.set(id, session)
+        void session.connect(peer, id, conversation.settings, memory).catch(async error => {
+          console.error('Gemini connection failed', error instanceof Error ? error.message : error)
+          if (peer.readyState === WebSocket.OPEN) peer.send(JSON.stringify({ type: 'error', message: 'Gemini Live could not connect.' }))
+          await session.close()
+          activeVoices.delete(id)
+          await store.setConversation(id, 'incomplete')
+        })
+      })
+    })().catch(() => socket.destroy())
+    return
+  }
   if (url.pathname !== '/events') { socket.destroy(); return }
   void (async () => {
     const visitorId = await identity(request)

@@ -13,7 +13,7 @@ delete process.env.DATABASE_URL
 const db = await openDatabase()
 const published: AppEvent[] = []
 const store = new Store(db, event => published.push(event))
-const settings: Settings = { mode: 'family', style: 'gentle', pace: 'unhurried', focus: 'everyday', voice: 'marin' }
+const settings: Settings = { provider: 'openai', mode: 'family', style: 'gentle', pace: 'unhurried', focus: 'everyday', voice: 'marin' }
 after(async () => { await db.close(); await rm(dataDir, { recursive: true, force: true }) })
 
 test('visitor isolation, atomic turn jobs, correction, and deletion', async () => {
@@ -36,6 +36,15 @@ test('visitor isolation, atomic turn jobs, correction, and deletion', async () =
   assert.equal((await store.facts(conversation.id)).find(item => item.id === fact.id)?.status, 'corrected')
   assert.equal((await store.pendingJobs()).length, 8)
   assert.equal(published.filter(event => event.type === 'turn').length, 2)
+  const auto = await store.replaceFact(corrected!.id, { conversation_id: conversation.id, widget: 'circle',
+    title: 'Sister Nina', detail: 'Nina may help on Friday', status: 'reported', source_turn_id: first.turn.id,
+    source_quote: first.turn.text, supersedes_id: corrected!.id })
+  assert.equal(auto.supersedes_id, corrected!.id)
+  assert.equal((await store.facts(conversation.id)).find(item => item.id === corrected!.id)?.status, 'corrected')
+  const pending = await store.pendingJobs()
+  await store.jobStatus(pending[0].id, 'running')
+  await store.recoverJobs()
+  assert.equal((await store.pendingJobs()).length, 8)
   await db.query('DELETE FROM conversations WHERE id=$1', [conversation.id])
   assert.equal((await db.query('SELECT * FROM analysis_jobs WHERE conversation_id=$1', [conversation.id])).rows.length, 0)
   assert.equal((await db.query('SELECT * FROM facts WHERE conversation_id=$1', [conversation.id])).rows.length, 0)

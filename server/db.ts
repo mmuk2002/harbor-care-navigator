@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
 
 export async function openDatabase(): Promise<Database> {
   if (process.env.DATABASE_URL) {
-    const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 8, ssl: process.env.PGSSL === 'disable' ? false : { rejectUnauthorized: false } })
+    const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 8,
+      ssl: process.env.PGSSL === 'require' ? { rejectUnauthorized: false } : false })
     await pool.query(schema)
     const query: Database['query'] = async <T>(sql: string, params: unknown[] = []) => {
       const result = await pool.query(sql, params)

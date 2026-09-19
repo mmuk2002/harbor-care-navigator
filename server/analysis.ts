@@ -1,4 +1,5 @@
 import OpenAI from 'openai'
+import { GoogleGenAI } from '@google/genai'
 import { type Fact, type Turn, type WidgetId } from '../shared/types.js'
 import type { Store } from './store.js'
 
@@ -51,12 +52,33 @@ async function modelExtract(widget: WidgetId, turn: Turn, recent: Turn[], facts:
     instructions: `You extract one kind of navigator information: ${widgetInstructions[widget]}\n` +
       'Only extract information explicitly supported by the NEW USER TURN. The quote must be a verbatim substring of that turn. ' +
       'Return at most three useful, nonduplicate items. If no relevant detail exists, return an empty array. ' +
-      'Use short titles and plain details. A correction can set corrects to the title of a prior item; otherwise use an empty string. ' +
+      'Use specific short titles and plain details. If this turn revises a prior item, set corrects to its exact title; otherwise use an empty string. ' +
       'These are reported facts, not verified medical facts. No diagnosis, medication decision, or invented commitments.',
     input: `Recent conversation:\n${context}\n\nExisting ${widget} items:\n${prior || '(none)'}\n\nNEW USER TURN:\n${turn.text}`,
     text: { format: { type: 'json_schema', name: 'widget_items', strict: true, schema } },
   })
   const parsed = JSON.parse(response.output_text || '{"items":[]}') as { items?: ExtractedItem[] }
+  return (parsed.items || []).slice(0, 3)
+}
+
+async function geminiExtract(widget: WidgetId, turn: Turn, recent: Turn[], facts: Fact[]): Promise<ExtractedItem[]> {
+  const client = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  const context = recent.slice(-8).map(t => `${t.speaker}: ${t.text}`).join('\n')
+  const prior = facts.filter(f => f.widget === widget && f.status !== 'corrected').slice(-8)
+    .map(f => `${f.title}: ${f.detail}`).join('\n')
+  const response = await client.models.generateContent({
+    model: process.env.GEMINI_WIDGET_MODEL || 'gemini-3.5-flash-lite',
+    contents: `Recent conversation:\n${context}\n\nExisting ${widget} items:\n${prior || '(none)'}\n\nNEW USER TURN:\n${turn.text}`,
+    config: {
+      systemInstruction: `Extract one kind of care-navigation information: ${widgetInstructions[widget]}\n` +
+        'Only extract details explicitly supported by the NEW USER TURN. Quote verbatim from that turn. ' +
+        'Return at most three useful nonduplicate items. If no relevant detail exists, return an empty array. ' +
+        'Use specific short titles and plain details. If this turn revises a prior item, set corrects to its exact title; otherwise use an empty string. ' +
+        'These are reported facts, not verified medical facts. Do not invent diagnoses, commitments, or completed arrangements.',
+      responseMimeType: 'application/json', responseJsonSchema: schema,
+    },
+  })
+  const parsed = JSON.parse(response.text || '{"items":[]}') as { items?: ExtractedItem[] }
   return (parsed.items || []).slice(0, 3)
 }
 
@@ -76,24 +98,31 @@ export function startAnalysis(store: Store): { kick: () => void; stop: () => voi
       const turns = await store.turns(job.conversation_id)
       const turn = turns.find(t => t.id === job.turn_id)
       if (!turn || turn.speaker !== 'user') { await store.jobStatus(job.id, 'done'); return }
-      if (turn.source_id.startsWith('correction:') && !process.env.OPENAI_API_KEY) {
+      const conversation = await store.conversationInternal(job.conversation_id)
+      const provider = conversation?.settings.provider || 'openai'
+      const modelKey = provider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.OPENAI_API_KEY
+      if (turn.source_id.startsWith('correction:') && !modelKey) {
         await store.setWidget(job.conversation_id, job.widget, 'current', turn.id, Date.now() - started)
         await store.jobStatus(job.id, 'done')
         return
       }
       const existing = await store.facts(job.conversation_id, job.widget)
       const manuallyCorrected = existing.some(f => f.source_turn_id === turn.id && f.supersedes_id)
-      const extracted = process.env.OPENAI_API_KEY
-        ? await modelExtract(job.widget, turn, turns, existing)
+      const extracted = modelKey
+        ? provider === 'gemini' ? await geminiExtract(job.widget, turn, turns, existing)
+          : await modelExtract(job.widget, turn, turns, existing)
         : ruleExtract(job.widget, turn)
       for (const item of extracted) {
         if (manuallyCorrected) continue
         if (!item.quote || !turn.text.includes(item.quote)) continue
         if (!item.title.trim() || !item.detail.trim()) continue
         if (existing.some(f => f.title === item.title && f.detail === item.detail && f.status !== 'corrected')) continue
-        await store.addFact({ conversation_id: job.conversation_id, widget: job.widget,
+        const input = { conversation_id: job.conversation_id, widget: job.widget,
           title: item.title.slice(0, 120), detail: item.detail.slice(0, 600), status: item.status,
-          source_turn_id: turn.id, source_quote: item.quote.slice(0, 500), supersedes_id: null })
+          source_turn_id: turn.id, source_quote: item.quote.slice(0, 500), supersedes_id: null }
+        const old = item.corrects ? existing.find(f => f.title.toLowerCase() === item.corrects.toLowerCase() && f.status !== 'corrected') : null
+        if (old) await store.replaceFact(old.id, { ...input, supersedes_id: old.id })
+        else await store.addFact(input)
       }
       await store.setWidget(job.conversation_id, job.widget, 'current', turn.id, Date.now() - started)
       await store.jobStatus(job.id, 'done')
@@ -116,6 +145,7 @@ export function startAnalysis(store: Store): { kick: () => void; stop: () => voi
   }
 
   const timer = setInterval(() => { void tick().catch(error => console.error('Analysis queue error', error)) }, 350)
+  void store.recoverJobs().then(tick).catch(error => console.error('Analysis recovery failed', error))
   return {
     kick: () => { void tick().catch(console.error) },
     stop: () => { stopped = true; clearInterval(timer) },
