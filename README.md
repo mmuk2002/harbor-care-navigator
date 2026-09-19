@@ -2,13 +2,13 @@
 
 Live demo: https://harbor-web-production-9d86.up.railway.app
 
-Harbor is a patient- and family-facing AI voice navigator. It listens through a browser call, keeps a persistent transcript, and updates four independent live views: the care circle, care timeline, needs and questions, and next steps. Each extracted detail links to the turn that supports it. A person can correct a detail, review what changed over the session, or delete the conversation.
+Harbor is a patient-facing AI voice navigator. It listens through a browser call, keeps a persistent transcript, and updates four independent live views: the care circle, care timeline, needs and questions, and next steps. Those views are longitudinal: confirmed details and corrections carry into future conversations for the same patient profile. Each extracted detail links to the turn that supports it. A patient can correct a detail, review what changed over the session, or delete the conversation.
 
 Harbor is **non-clinical**. It does not diagnose, advise medication changes, or claim that appointments, rides, or follow-ups were arranged. The interface identifies it as AI. Use fictional or de-identified information for a demo; this prototype is not a production clinical record system.
 
 ## What to try
 
-1. Choose **Family or caregiver** or **Patient**, choose OpenAI or Gemini under **Voice service**, then adjust tone, pace, focus, and voice. Both providers use the same persona, transcript, persistence, correction, and widget pipeline.
+1. The app is intentionally configured for the **Patient**. Choose OpenAI or Gemini under **Voice service**, then adjust tone, pace, focus, and voice. Both providers use the same persona, transcript, persistence, correction, and widget pipeline.
 2. Start a call, mention a person, an appointment, a practical barrier, and an action you intend to take. Open **Live workspace** while speaking to see four independently updating views.
 3. Say that one of those details was wrong. Check the new source-linked item and the replay timeline. End the call, reload the page, and reopen it from **Conversations**.
 4. If you want to inspect the interface without using voice, select **Explore a fictional sample conversation**. Its Thursday correction and unconfirmed ride show how uncertainty and changes are represented. The sample is scripted and explicitly separate from a live call.
@@ -16,12 +16,12 @@ Harbor is **non-clinical**. It does not diagnose, advise medication changes, or 
 | Prompt level | Implemented evidence |
 | --- | --- |
 | Level 1 | Start/end a WebRTC voice call; save finalized user and assistant turns, settings, and history in PostgreSQL/PGlite. |
-| Level 2 | Live transcript and widget status through a visitor-scoped WebSocket; configurable caller mode, tone, pace, focus, and voice. |
+| Level 2 | Live transcript and widget status through a visitor-scoped WebSocket; configurable tone, pace, focus, and voice. |
 | Level 3 | Four independently scheduled, persisted widget jobs with per-widget status, timing, source quotes, correction history, and event replay. |
 
 ```mermaid
 flowchart LR
-  Browser[Patient or family browser] <-->|WebRTC audio| Voice[OpenAI Realtime]
+  Browser[Patient browser] <-->|WebRTC audio| Voice[OpenAI Realtime]
   Browser <-->|PCM audio WebSocket| Gemini[Gemini Live]
   Browser <-->|HTTPS and events WebSocket| App[Fastify app]
   App <-->|Sideband transcript| Voice
@@ -54,7 +54,7 @@ On Railway, create a service from this repository, add a PostgreSQL service, map
 
 - React client uses WebRTC for the browser-to-OpenAI Realtime audio call. Fastify creates the call using the server-held API key and attaches a server-side monitoring WebSocket for finalized transcripts. The Gemini option uses a server-side Gemini Live WebSocket and a browser AudioWorklet: the browser sends 16 kHz PCM and receives 24 kHz PCM while the server saves Gemini input/output transcriptions through the same Store.
 - A user turn, its event, and four analysis jobs are committed in one database transaction. Four widget lanes process each turn independently using structured model output; each job validates its source quote before saving a fact. The keyless text sandbox uses lightweight rule extraction for local inspection.
-- PostgreSQL/PGlite store visitors, conversations, turns, facts, widget states, events, and jobs. A random HttpOnly visitor cookie scopes access. This is convenient for a demo, not a replacement for production authentication.
+- PostgreSQL/PGlite store visitors, conversations, turns, facts, widget states, events, and jobs. The patient profile endpoint aggregates current facts across all of that patient's conversations, so a new call can begin with continuity. A random HttpOnly visitor cookie scopes access. This is convenient for a demo, not a replacement for production authentication.
 - Corrections preserve the original item as corrected, write a replacement linked to it, and reprocess all widgets. The replay slider reads persisted events. Deletion cascades through all conversation data.
 
 ## Checks
