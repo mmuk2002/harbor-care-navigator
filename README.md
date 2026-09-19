@@ -1,5 +1,7 @@
 # Harbor — a voice care navigator
 
+Live demo: https://harbor-web-production-9d86.up.railway.app
+
 Harbor is a patient- and family-facing AI voice navigator. It listens through a browser call, keeps a persistent transcript, and updates four independent live views: the care circle, care timeline, needs and questions, and next steps. Each extracted detail links to the turn that supports it. A person can correct a detail, review what changed over the session, or delete the conversation.
 
 Harbor is **non-clinical**. It does not diagnose, advise medication changes, or claim that appointments, rides, or follow-ups were arranged. The interface identifies it as AI. Use fictional or de-identified information for a demo; this prototype is not a production clinical record system.

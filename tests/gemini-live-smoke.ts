@@ -5,7 +5,7 @@ const context = await browser.newContext({ permissions: ['microphone'] })
 const page = await context.newPage()
 page.on('console', message => { if (message.type() === 'error') console.error('Browser:', message.text()) })
 try {
-  await page.goto('http://localhost:3000/', { waitUntil: 'networkidle' })
+  await page.goto(process.env.HARBOR_URL || 'http://localhost:3000/', { waitUntil: 'networkidle' })
   await page.getByRole('button', { name: /Start a conversation/ }).click()
   await page.getByText('Live conversation', { exact: true }).waitFor({ timeout: 30000 })
   console.log('Gemini Live connected')

@@ -11,7 +11,7 @@ try {
     const body = await response.json() as { conversations: unknown[]; visitorId: string; providers?: unknown }
     await route.fulfill({ response, json: { ...body, providers: { openai: false, gemini: false } } })
   })
-  await page.goto('http://localhost:3000/', { waitUntil: 'networkidle' })
+  await page.goto(process.env.HARBOR_URL || 'http://localhost:3000/', { waitUntil: 'networkidle' })
   await page.screenshot({ path: 'tmp/home.png', fullPage: true })
   await page.getByRole('button', { name: /Open text sandbox/ }).click()
   await page.getByLabel('Explore with text while live voice is being connected').fill(
